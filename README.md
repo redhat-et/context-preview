@@ -2,6 +2,8 @@
 
 An OpenCode plugin to remind you to turn off skills and MCP servers
 
+![Context preview in action](./docs/context-preview.png)
+
 This plugin lists connected MCP servers and estimates how many tokens agent skill descriptions will add to the model context. It shows an itemized TUI toast during startup, caches a report for a local CLI command, and can toggle skills for the current OpenCode runtime.
 
 ## How it Works
