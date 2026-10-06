@@ -99,6 +99,7 @@ test("builds the startup toast and saves a CLI-readable report", async (t) => {
   await mkdir(path.join(project, ".opencode", "skills", "review"), { recursive: true })
   await mkdir(path.join(project, ".opencode", "skills", "private-skill"), { recursive: true })
   await mkdir(path.join(project, ".opencode", "skill", "legacy"), { recursive: true })
+  await mkdir(path.join(project, ".claude", "skills", "claude-skill"), { recursive: true })
   await mkdir(path.join(project, "vendor", "skills", "custom-path-skill"), { recursive: true })
   const linkedSkill = path.join(temp, "linked-skill")
   await mkdir(linkedSkill, { recursive: true })
@@ -115,6 +116,10 @@ test("builds the startup toast and saves a CLI-readable report", async (t) => {
   await writeFile(
     path.join(project, ".opencode", "skill", "legacy", "SKILL.md"),
     "---\nname: legacy\ndescription: Legacy singular skill path\n---\nInstructions",
+  )
+  await writeFile(
+    path.join(project, ".claude", "skills", "claude-skill", "SKILL.md"),
+    "---\nname: claude-skill\ndescription: Skill imported from Claude\n---\nInstructions",
   )
   await writeFile(
     path.join(project, "vendor", "skills", "custom-path-skill", "SKILL.md"),
@@ -194,6 +199,7 @@ test("builds the startup toast and saves a CLI-readable report", async (t) => {
   assert.match(toastBodies[0].message, /MCP search:/)
   assert.match(toastBodies[0].message, /Skill review:/)
   assert.match(toastBodies[0].message, /Skill legacy:/)
+  assert.match(toastBodies[0].message, /Skill claude-skill:/)
   assert.match(toastBodies[0].message, /Skill custom-path-skill:/)
   assert.match(toastBodies[0].message, /Skill linked-skill:/)
   assert.doesNotMatch(toastBodies[0].message, /private-skill|MCP disabled/)
@@ -202,6 +208,7 @@ test("builds the startup toast and saves a CLI-readable report", async (t) => {
   await hooks["experimental.chat.system.transform"]({}, {
     system: [
       "<available_skills>",
+      "<skill><name>claude-skill</name><description>Skill imported from Claude</description></skill>",
       "<skill><name>custom-path-skill</name><description>Skill from configured path</description></skill>",
       "<skill><name>legacy</name><description>Legacy singular skill path</description></skill>",
       "<skill><name>linked-skill</name><description>Skill installed through a symlink</description></skill>",
@@ -214,6 +221,7 @@ test("builds the startup toast and saves a CLI-readable report", async (t) => {
    assert.doesNotMatch(JSON.stringify(cachedReport), /search_lookup/)
   assert.equal(cachedReport.worktree, canonicalProject)
   assert.ok(cachedReport.skillSearchPaths.includes(path.join(project, ".opencode", "skills")))
+  assert.ok(cachedReport.skillSearchPaths.includes(path.join(project, ".claude", "skills")))
   assert.ok(!cachedReport.skillSearchPaths.includes("/.opencode/skills"))
 
   const cli = path.resolve("bin/context-preview.js")
@@ -225,6 +233,7 @@ test("builds the startup toast and saves a CLI-readable report", async (t) => {
    assert.doesNotMatch(output, /search_lookup|Search documents/)
   assert.match(output, /review: ~/)
   assert.match(output, /legacy: ~/)
+  assert.match(output, /claude-skill: ~/)
   assert.match(output, /custom-path-skill: ~/)
   assert.match(output, /linked-skill: ~/)
   assert.doesNotMatch(output, /private-skill|search_private|MCP disabled/)

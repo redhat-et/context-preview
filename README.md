@@ -8,7 +8,7 @@ This plugin lists connected MCP servers and estimates how many tokens agent skil
 
 ## How it Works
 
-When OpenCode starts, the plugin builds a report and displays an itemized TUI toast. It lists configured MCP servers that are enabled and currently `connected`. It discovers skills from the project and parent `.opencode` and `.agents` directories, global OpenCode/Agents directories, and any paths in `skills.paths`. Only valid `SKILL.md` files are included, and OpenCode skill permissions are applied first.
+When OpenCode starts, the plugin builds a report and displays an itemized TUI toast. It lists configured MCP servers that are enabled and currently `connected`. It discovers skills from the project and parent `.opencode`, `.claude`, and `.agents` directories, their global equivalents, and any paths in `skills.paths`. This includes Claude-compatible skills imported by OpenCode from `.claude/skills`. Only valid `SKILL.md` files are included, and OpenCode skill permissions are applied first.
 
 ### Context Cost Estimates
 
