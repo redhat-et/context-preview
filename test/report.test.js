@@ -285,6 +285,27 @@ test("builds the startup toast and saves a CLI-readable report", async (t) => {
     /Skill command handled/,
   )
   assert.deepEqual(JSON.parse(await readFile(skillToggleFile(project), "utf8")), { disabledSkills: ["review"] })
+  await assert.rejects(
+    hooks["command.execute.before"]({ command: "skill-toggle", arguments: "off all" }, { parts: [] }),
+    /Skill command handled/,
+  )
+  assert.equal(toastBodies.at(-1).message, "All skills: off")
+  const allDisabled = JSON.parse(await readFile(skillToggleFile(project), "utf8"))
+  assert.ok(allDisabled.disabledSkills.length >= 5)
+  for (const name of ["claude-skill", "custom-path-skill", "legacy", "linked-skill", "review"]) {
+    assert.ok(allDisabled.disabledSkills.includes(name))
+  }
+  assert.ok(!allDisabled.disabledSkills.includes("private-skill"))
+  await assert.rejects(
+    hooks["command.execute.before"]({ command: "skill-toggle", arguments: "on all" }, { parts: [] }),
+    /Skill command handled/,
+  )
+  assert.equal(toastBodies.at(-1).message, "All skills: on")
+  assert.deepEqual(JSON.parse(await readFile(skillToggleFile(project), "utf8")), { disabledSkills: [] })
+  await assert.rejects(
+    hooks["command.execute.before"]({ command: "skill-toggle", arguments: "off review" }, { parts: [] }),
+    /Skill command handled/,
+  )
   const { ContextPreviewPlugin: FreshContextPreviewPlugin } = await import(`../index.js?persisted=${Date.now()}`)
   const recreatedHooks = await FreshContextPreviewPlugin({ client, directory: project, worktree: "/" })
   const recreatedProviderSystem = [

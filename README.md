@@ -103,9 +103,11 @@ Use the plugin's `/skill-toggle` command to inspect or change skill availability
 /skill-toggle off review
 /skill-toggle on review
 /skill-toggle toggle review
+/skill-toggle off all
+/skill-toggle on all
 ```
 
-With no arguments, the command lists known skills and their `on` or `off` state. Passing only a skill name toggles it. Skill names must match exactly.
+With no arguments, the command lists known skills and their `on` or `off` state. Passing only a skill name toggles it. Use `on all` or `off all` to change every known skill at once. Skill names must match exactly.
 
 Changing a skill starts a new session to clear stale conversation context. Toggle state is cached per project alongside the context preview report. A disabled skill is removed from the provider's skill inventory and skill-tool description, matching references in system instructions are redacted, and direct attempts to load it are blocked.
 

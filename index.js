@@ -403,13 +403,24 @@ export const ContextPreviewPlugin = async ({ client, directory, worktree }, opti
           },
         })
       } else {
-        const skill = skills.find((entry) => entry.name === parsed.name)
-        if (!skill) throw new Error(`Unknown skill: ${parsed.name}`)
-        if (parsed.action === "on") disabledSkills.delete(skill.name)
-        if (parsed.action === "off") disabledSkills.add(skill.name)
-        if (parsed.action === "toggle") {
-          if (disabledSkills.has(skill.name)) disabledSkills.delete(skill.name)
-          else disabledSkills.add(skill.name)
+        const allSkills = parsed.name === "all" && (parsed.action === "on" || parsed.action === "off")
+        let message
+        if (allSkills) {
+          disabledSkills.clear()
+          if (parsed.action === "off") {
+            for (const skill of skills) disabledSkills.add(skill.name)
+          }
+          message = `All skills: ${parsed.action}`
+        } else {
+          const skill = skills.find((entry) => entry.name === parsed.name)
+          if (!skill) throw new Error(`Unknown skill: ${parsed.name}`)
+          if (parsed.action === "on") disabledSkills.delete(skill.name)
+          if (parsed.action === "off") disabledSkills.add(skill.name)
+          if (parsed.action === "toggle") {
+            if (disabledSkills.has(skill.name)) disabledSkills.delete(skill.name)
+            else disabledSkills.add(skill.name)
+          }
+          message = `${skill.name}: ${disabledSkills.has(skill.name) ? "off" : "on"}`
         }
         try {
           await saveDisabledSkills()
@@ -420,7 +431,7 @@ export const ContextPreviewPlugin = async ({ client, directory, worktree }, opti
         await client.tui.showToast({
           body: {
             title: "Agent skills",
-            message: `${skill.name}: ${disabledSkills.has(skill.name) ? "off" : "on"}`,
+            message,
             variant: "info",
             duration: 5000,
           },
