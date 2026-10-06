@@ -54,10 +54,10 @@ When upgrading, use the exact published version so OpenCode does not reuse a
 stale `latest` cache entry:
 
 ```sh
-opencode plugin opencode-context-preview@0.1.1 --global --force
+opencode plugin opencode-context-preview@0.1.2 --global --force
 ```
 
-Replace `0.1.1` with the version being installed.
+Replace `0.1.2` with the version being installed.
 
 The plugin retries briefly while the TUI attaches. If the first prompt arrives before the startup preview appears, the plugin displays the preview and stops that request before it reaches the model. Prompt text is restored when possible; attachments must be reattached before resending. If the preview cannot be displayed, the request is also blocked by default.
 
