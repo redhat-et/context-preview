@@ -1,7 +1,7 @@
 import { mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 import os from "node:os"
-import { reportCacheFile } from "./lib/cache.js"
+import { reportCacheFile, skillToggleFile } from "./lib/cache.js"
 import {
   estimateTokens,
   formatToast,
@@ -288,6 +288,25 @@ export const ContextPreviewPlugin = async ({ client, directory, worktree }, opti
     }
   }
 
+  if (disabledSkills.size === 0) {
+    try {
+      const saved = JSON.parse(await readFile(skillToggleFile(runtimeKey), "utf8"))
+      if (Array.isArray(saved.disabledSkills)) {
+        for (const name of saved.disabledSkills) {
+          if (typeof name === "string" && name) disabledSkills.add(name)
+        }
+      }
+    } catch {
+      // Missing or invalid preferences should not prevent the plugin from loading.
+    }
+  }
+
+  const saveDisabledSkills = async () => {
+    const file = skillToggleFile(runtimeKey)
+    await mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
+    await writeFile(file, `${JSON.stringify({ disabledSkills: [...disabledSkills].sort() }, null, 2)}\n`, { mode: 0o600 })
+  }
+
   const startNewSession = async () => {
     try {
       if (typeof client.tui.executeCommand !== "function") return
@@ -302,9 +321,18 @@ export const ContextPreviewPlugin = async ({ client, directory, worktree }, opti
       reportPromise = (async () => {
         let report
         try {
-          report = await buildReport({ client, directory, worktree })
+          const discoveredReport = await buildReport({ client, directory, worktree })
+          const enabledSkills = discoveredReport.skills.filter((skill) => !disabledSkills.has(skill.name))
+          report = {
+            ...discoveredReport,
+            skills: enabledSkills,
+            totals: {
+              ...discoveredReport.totals,
+              skillTokens: enabledSkills.reduce((sum, skill) => sum + skill.estimatedTokens, 0),
+            },
+          }
           currentReport = report
-          for (const skill of report.skills) knownSkills.set(skill.name, skill)
+          for (const skill of discoveredReport.skills) knownSkills.set(skill.name, skill)
         } catch (error) {
           reportPromise = undefined
           await logWarning("Could not build the context preview", error)
@@ -382,6 +410,11 @@ export const ContextPreviewPlugin = async ({ client, directory, worktree }, opti
         if (parsed.action === "toggle") {
           if (disabledSkills.has(skill.name)) disabledSkills.delete(skill.name)
           else disabledSkills.add(skill.name)
+        }
+        try {
+          await saveDisabledSkills()
+        } catch (error) {
+          await logWarning("Could not save skill toggle state", error)
         }
         await startNewSession()
         await client.tui.showToast({

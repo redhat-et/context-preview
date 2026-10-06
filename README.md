@@ -22,7 +22,7 @@ It counts Unicode characters in that serialized string, divides the count by fou
 
 ### Disabling Skills
 
-`/skill-toggle off <name>` (or `/skill-toggle <name>` to toggle) records the disabled name in memory for the current project. The setting is shared by plugin instances for that project and lasts until OpenCode restarts. Toggling starts a new session to clear the old conversation context.
+`/skill-toggle off <name>` (or `/skill-toggle <name>` to toggle) records the disabled name for the current project. The setting is shared by OpenCode sessions for that project. Toggling starts a new session to clear the old conversation context.
 
 For a disabled skill, the plugin:
 
@@ -75,7 +75,8 @@ For headless or automated use, disable this first-prompt gate with a plugin opti
 ## View the full report
 
 The report command is optional and is separate from installing the OpenCode
-plugin. Install the package globally to make its executable available:
+plugin. Disabled skills are excluded from the cached report, startup toast, and
+skill token total. Install the package globally to make its executable available:
 
 ```sh
 npm install --global opencode-context-preview
@@ -90,7 +91,7 @@ npx --yes opencode-context-preview
 
 The command searches the current directory and its parents for the latest cached report without making an LLM request. Add `--json` for machine-readable output or `--help` for usage. Restart OpenCode after changing configured MCP servers or installed skills. The plugin also reconciles the cache with the actual skill inventory before a provider request.
 
-Reports are cached under `~/.cache/opencode/context-preview/`. Set `OPENCODE_CONTEXT_PREVIEW_CACHE_DIR` to use a different directory.
+Reports and project-scoped skill toggle preferences are cached under `~/.cache/opencode/context-preview/` by default. Toggle preferences are stored as `<project-path-hash>.toggles.json`, next to the corresponding `<project-path-hash>.json` report cache. Set `OPENCODE_CONTEXT_PREVIEW_CACHE_DIR` to use a different directory for both files.
 
 ## Toggle skills
 
@@ -106,9 +107,9 @@ Use the plugin's `/skill-toggle` command to inspect or change skill availability
 
 With no arguments, the command lists known skills and their `on` or `off` state. Passing only a skill name toggles it. Skill names must match exactly.
 
-Changing a skill starts a new session to clear stale conversation context. A disabled skill is removed from the provider's skill inventory and skill-tool description, matching references in system instructions are redacted, and direct attempts to load it are blocked.
+Changing a skill starts a new session to clear stale conversation context. Toggle state is cached per project alongside the context preview report. A disabled skill is removed from the provider's skill inventory and skill-tool description, matching references in system instructions are redacted, and direct attempts to load it are blocked.
 
-The command is handled locally without an LLM request. Toggle state is shared by plugin instances for the same project and lasts until OpenCode restarts. Configured skill permissions still take precedence.
+The command is handled locally without an LLM request. Toggle preferences are stored under the local context-preview cache directory (or `OPENCODE_CONTEXT_PREVIEW_CACHE_DIR` when set). Configured skill permissions still take precedence.
 
 ## What is counted
 

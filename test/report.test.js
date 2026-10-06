@@ -5,7 +5,7 @@ import os from "node:os"
 import path from "node:path"
 import test from "node:test"
 import { ContextPreviewPlugin } from "../index.js"
-import { reportCacheFile } from "../lib/cache.js"
+import { reportCacheFile, skillToggleFile } from "../lib/cache.js"
 import {
   estimateTokens,
   formatReport,
@@ -284,7 +284,9 @@ test("builds the startup toast and saves a CLI-readable report", async (t) => {
     hooks["command.execute.before"]({ command: "skill-toggle", arguments: "off review" }, { parts: [] }),
     /Skill command handled/,
   )
-  const recreatedHooks = await ContextPreviewPlugin({ client, directory: project, worktree: "/" })
+  assert.deepEqual(JSON.parse(await readFile(skillToggleFile(project), "utf8")), { disabledSkills: ["review"] })
+  const { ContextPreviewPlugin: FreshContextPreviewPlugin } = await import(`../index.js?persisted=${Date.now()}`)
+  const recreatedHooks = await FreshContextPreviewPlugin({ client, directory: project, worktree: "/" })
   const recreatedProviderSystem = [
     "<available_skills><skill><name>review</name><description>Review changes carefully</description></skill><skill><name>legacy</name><description>Legacy singular skill path</description></skill></available_skills>",
   ]
@@ -294,6 +296,10 @@ test("builds the startup toast and saves a CLI-readable report", async (t) => {
   assert.doesNotMatch(recreatedProviderSystem[0], /<name>review<\/name>/)
   assert.match(recreatedProviderSystem[0], /<name>legacy<\/name>/)
   await new Promise((resolve) => setTimeout(resolve, 150))
+  assert.ok(toastBodies.length >= 4)
+  assert.doesNotMatch(toastBodies.at(-1).message, /Skill review:/)
+  const persistedReport = JSON.parse(await readFile(reportCacheFile(canonicalProject), "utf8"))
+  assert.doesNotMatch(JSON.stringify(persistedReport), /"name": "review"/)
 })
 
 test("stops the first provider-bound message if the preview was not shown yet", async (t) => {
