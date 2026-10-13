@@ -41,6 +41,15 @@ test("parses active skill entries from OpenCode's system prompt", () => {
   assert.equal(parseAvailableSkills(["system prompt without a skill list"]), undefined)
 })
 
+test("parses V2 skill IDs separately from display names", () => {
+  assert.deepEqual(
+    parseAvailableSkills([
+      "<available_skills><skill><id>code-review</id><name>Code Review</name><description>Review changes</description></skill></available_skills>",
+    ]),
+    [{ id: "code-review", name: "Code Review", description: "Review changes" }],
+  )
+})
+
 test("honors the most specific skill deny rule", () => {
   assert.equal(isSkillAllowed("internal-db", { "*": "deny", "internal-*": "allow", "internal-db": "deny" }), false)
   assert.equal(isSkillAllowed("public-docs", { "internal-*": "deny" }), true)

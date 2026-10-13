@@ -1,6 +1,7 @@
 import { mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises"
 import path from "node:path"
 import os from "node:os"
+import { Plugin } from "@opencode/plugin"
 import { reportCacheFile, skillToggleFile } from "./lib/cache.js"
 import {
   estimateTokens,
@@ -27,8 +28,12 @@ function valueOf(result) {
 function skillCommandMessage(skills, disabled) {
   if (skills.length === 0) return "No skills are available to toggle."
   return skills
-    .map((skill) => `${disabled.has(skill.name) ? "off" : "on "} ${skill.name}`)
+    .map((skill) => `${skillIsDisabled(skill, disabled) ? "off" : "on "} ${skill.name}`)
     .join("\n")
+}
+
+function skillIsDisabled(skill, disabled) {
+  return disabled.has(skill?.id) || disabled.has(skill?.name)
 }
 
 function filterDisabledSkills(system, disabled) {
@@ -47,7 +52,7 @@ function redactDisabledSkillText(text, disabled, knownSkills) {
   let redacted = text
   for (const name of disabled) {
     const skill = knownSkills.get(name)
-    for (const value of [name, skill?.description]) {
+    for (const value of [name, skill?.id, skill?.name, skill?.description]) {
       if (!value) continue
       redacted = redacted.replaceAll(value, "")
     }
@@ -509,4 +514,437 @@ export const ContextPreviewPlugin = async ({ client, directory, worktree }, opti
       if (event.type === "server.connected" || event.type === "session.created") await initialize()
     },
   }
+}
+
+function v2ProjectRoot(ctx) {
+  const directory = ctx.location?.directory || process.cwd()
+  const project = ctx.location?.project
+  return projectRoot(directory, project?.canonical || project?.directory || directory)
+}
+
+async function v2List(domain) {
+  if (typeof domain?.list !== "function") return undefined
+  try {
+    const result = valueOf(await domain.list())
+    return Array.isArray(result) ? result : []
+  } catch {
+    return undefined
+  }
+}
+
+function v2SkillSource(skill, directory) {
+  const skillPath = typeof skill.path === "string" ? path.resolve(skill.path) : ""
+  if (!skillPath) return "v2"
+  const relative = path.relative(path.resolve(directory), skillPath)
+  if (relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))) {
+    return "project"
+  }
+  const home = os.homedir()
+  if (skillPath.startsWith(path.join(home, ".config", "opencode"))) return "global:opencode"
+  if (skillPath.startsWith(path.join(home, ".claude"))) return "global:claude"
+  if (skillPath.startsWith(path.join(home, ".agents"))) return "global:agents"
+  return "v2"
+}
+
+function v2SkillId(skill) {
+  if (typeof skill?.id === "string" && skill.id) return skill.id
+  if (typeof skill?.name === "string" && skill.name) return skill.name
+  return undefined
+}
+
+function v2FindSkill(skills, key) {
+  if (typeof key !== "string") return undefined
+  return [...skills.values()].find((skill) => skill.id === key || skill.name === key)
+}
+
+async function buildV2Report({ ctx, directory, worktree, disabledSkills }) {
+  const servers = await v2List(ctx.mcp)
+  const availableSkills = await v2List(ctx.skill)
+  if (!servers || !availableSkills) throw new Error("OpenCode V2 catalog APIs are unavailable")
+  const mcpServers = servers
+    .map((server) => ({
+      name: server?.name,
+      status: typeof server?.status === "string" ? server.status : server?.status?.status,
+    }))
+    .filter((server) => typeof server.name === "string" && server.status === "connected")
+
+  const discoveredSkills = availableSkills
+    .map((skill) => {
+      if (skill?.autoinvoke === false) return undefined
+      const id = v2SkillId(skill)
+      const name = typeof skill?.name === "string" ? skill.name : id
+      const description = typeof skill?.description === "string" ? skill.description : ""
+      if (!id || !name || !description) return undefined
+      return {
+        id,
+        name,
+        description,
+        source: v2SkillSource(skill, directory),
+        estimatedTokens: estimateTokens(JSON.stringify({ name, description })),
+      }
+    })
+    .filter(Boolean)
+
+  let canonicalWorktree
+  try {
+    canonicalWorktree = await realpath(worktree)
+  } catch {
+    canonicalWorktree = worktree
+  }
+  const skills = discoveredSkills.filter((skill) => !skillIsDisabled(skill, disabledSkills))
+  return {
+    report: {
+      generatedAt: new Date().toISOString(),
+      worktree: canonicalWorktree,
+      estimateMethod: "Approximate: Unicode character count divided by four, rounded up.",
+      mcpServers,
+      skills,
+      skillSearchPaths: [],
+      totals: {
+        skillTokens: skills.reduce((sum, skill) => sum + skill.estimatedTokens, 0),
+      },
+    },
+    discoveredSkills,
+  }
+}
+
+function v2Log(level, message, error) {
+  try {
+    const logger = console[level] ?? console.info
+    logger(`[opencode-context-preview] ${message}${error ? `: ${String(error)}` : ""}`)
+    return true
+  } catch {
+    // Diagnostics must not interfere with plugin setup or event handling.
+    return false
+  }
+}
+
+function v2SystemText(part) {
+  if (typeof part === "string") return part
+  return typeof part?.text === "string" ? part.text : undefined
+}
+
+function filterV2System(system, disabled, knownSkills) {
+  return system.map((part) => {
+    const text = v2SystemText(part)
+    if (text === undefined) return part
+    const filteredSkills = text.replace(/\s*<skill>[\s\S]*?<\/skill>/g, (entry) => {
+      const id = entry.match(/<id>\s*([^<]+?)\s*<\/id>/)?.[1]
+      const name = entry.match(/<name>\s*([^<]+?)\s*<\/name>/)?.[1]
+      const skill = v2FindSkill(knownSkills, id) ?? v2FindSkill(knownSkills, name)
+      return skillIsDisabled(skill ?? { id: id ?? name, name }, disabled) ? "" : entry
+    })
+    const filtered = redactDisabledSkillText(filteredSkills, disabled, knownSkills)
+    return typeof part === "string" ? filtered : { ...part, text: filtered }
+  })
+}
+
+function v2PromptArguments(prompt) {
+  const text = typeof prompt?.text === "string" ? prompt.text.trim() : ""
+  return text.replace(/^\/?skill-toggle(?:\s+|$)/i, "").trim()
+}
+
+function v2EventIsLocal(event, directory) {
+  const eventDirectory = event?.location?.directory ?? event?.data?.location?.directory
+  return !eventDirectory || path.resolve(eventDirectory) === path.resolve(directory)
+}
+
+export const ContextPreviewV2Plugin = Plugin.define({
+  id: "opencode-context-preview",
+
+  async setup(ctx) {
+    const directory = ctx.location?.directory || process.cwd()
+    const runtimeKey = v2ProjectRoot(ctx)
+    const options = ctx.options ?? {}
+    const disabledSkills = disabledSkillsByProject.get(runtimeKey) ?? new Set()
+    disabledSkillsByProject.set(runtimeKey, disabledSkills)
+    const knownSkills = new Map()
+    let reportPromise
+    let currentReport
+    let noticePromise
+    let noticeShown = false
+
+    if (disabledSkills.size === 0) {
+      try {
+        const saved = JSON.parse(await readFile(skillToggleFile(runtimeKey), "utf8"))
+        if (Array.isArray(saved.disabledSkills)) {
+          for (const name of saved.disabledSkills) {
+            if (typeof name === "string" && name) disabledSkills.add(name)
+          }
+        }
+      } catch {
+        // Missing or invalid preferences should not prevent the plugin from loading.
+      }
+    }
+
+    const saveDisabledSkills = async () => {
+      const file = skillToggleFile(runtimeKey)
+      await mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
+      await writeFile(file, `${JSON.stringify({ disabledSkills: [...disabledSkills].sort() }, null, 2)}\n`, { mode: 0o600 })
+    }
+
+    const syncDisabledSkills = async () => {
+      try {
+        const saved = JSON.parse(await readFile(skillToggleFile(runtimeKey), "utf8"))
+        if (!Array.isArray(saved.disabledSkills)) return false
+        const next = new Set(saved.disabledSkills.filter((name) => typeof name === "string" && name))
+        const previous = JSON.stringify([...disabledSkills].sort())
+        const current = JSON.stringify([...next].sort())
+        if (previous === current) return false
+        disabledSkills.clear()
+        for (const name of next) disabledSkills.add(name)
+        return true
+      } catch {
+        return false
+      }
+    }
+
+    const loadReport = () => {
+      if (!reportPromise) {
+        reportPromise = (async () => {
+          try {
+            const result = await buildV2Report({ ctx, directory, worktree: runtimeKey, disabledSkills })
+            currentReport = result.report
+            knownSkills.clear()
+            for (const skill of result.discoveredSkills) knownSkills.set(skill.id ?? skill.name, skill)
+
+            try {
+              await saveReport(currentReport)
+            } catch (error) {
+              v2Log("warn", "Could not cache the context preview for the CLI", error)
+            }
+            return currentReport
+          } catch (error) {
+            reportPromise = undefined
+            v2Log("warn", "Could not build the context preview", error)
+            return undefined
+          }
+        })()
+      }
+      return reportPromise
+    }
+
+    const showStartupNotice = async (report) => {
+      try {
+        return v2Log("info", formatToast(report))
+      } catch {
+        return false
+      }
+    }
+
+    const initialize = async () => {
+      const report = await loadReport()
+      if (!report || noticeShown) return
+      if (!noticePromise) {
+        noticePromise = showStartupNotice(report).then((shown) => {
+          noticeShown = shown
+          noticePromise = undefined
+        })
+      }
+      await noticePromise
+    }
+
+    const refreshReport = async () => {
+      reportPromise = undefined
+      await loadReport()
+      if (!noticeShown) await initialize()
+    }
+
+    const updateCachedReport = async () => {
+      if (!currentReport) return
+      const skills = [...knownSkills.values()].filter((skill) => !skillIsDisabled(skill, disabledSkills))
+      currentReport = {
+        ...currentReport,
+        skills,
+        totals: {
+          ...currentReport.totals,
+          skillTokens: skills.reduce((sum, skill) => sum + skill.estimatedTokens, 0),
+        },
+      }
+      try {
+        await saveReport(currentReport)
+      } catch (error) {
+        v2Log("warn", "Could not cache the updated skill toggle state", error)
+      }
+    }
+
+    const reloadSkillState = async () => {
+      try {
+        if (typeof ctx.skill?.reload === "function") await ctx.skill.reload()
+      } catch (error) {
+        v2Log("warn", "Could not reload skills after changing skill state", error)
+      }
+      try {
+        if (typeof ctx.tool?.reload === "function") await ctx.tool.reload()
+      } catch (error) {
+        v2Log("warn", "Could not reload tools after changing skill state", error)
+      }
+    }
+
+    const handleSkillCommand = async (argumentsText) => {
+      const parsed = parseSkillCommand(argumentsText)
+      if (parsed.error) throw new Error(parsed.error)
+
+      if (!currentReport) await loadReport()
+      const skills = [...knownSkills.values()].sort((a, b) => a.name.localeCompare(b.name))
+      if (parsed.action === "list") {
+        v2Log("info", `Agent skills\n${skillCommandMessage(skills, disabledSkills)}`)
+        return
+      }
+
+      const allSkills = parsed.name === "all" && (parsed.action === "on" || parsed.action === "off")
+      let message
+      if (allSkills) {
+        disabledSkills.clear()
+        if (parsed.action === "off") {
+          for (const skill of skills) disabledSkills.add(skill.id ?? skill.name)
+        }
+        message = `All skills: ${parsed.action}`
+      } else {
+        const skill = skills.find((entry) => entry.id === parsed.name || entry.name === parsed.name)
+        if (!skill) throw new Error(`Unknown skill: ${parsed.name}`)
+        const key = skill.id ?? skill.name
+        if (parsed.action === "on") {
+          disabledSkills.delete(key)
+          disabledSkills.delete(skill.name)
+        }
+        if (parsed.action === "off") disabledSkills.add(key)
+        if (parsed.action === "toggle") {
+          if (skillIsDisabled(skill, disabledSkills)) {
+            disabledSkills.delete(key)
+            disabledSkills.delete(skill.name)
+          } else disabledSkills.add(key)
+        }
+        message = `${skill.name}: ${skillIsDisabled(skill, disabledSkills) ? "off" : "on"}`
+      }
+
+      try {
+        await saveDisabledSkills()
+      } catch (error) {
+        v2Log("warn", "Could not save skill toggle state", error)
+      }
+      await updateCachedReport()
+      await reloadSkillState()
+      v2Log("info", `Agent skills: ${message}. Start a new session to clear the old context.`)
+    }
+
+    // Load the initial inventory before registering the V2 skill transform so disabled
+    // skills remain known and can be enabled again later.
+    await loadReport()
+
+    if (typeof ctx.skill?.transform === "function") {
+      await ctx.skill.transform((editor) => {
+        for (const skill of editor.list?.() ?? []) {
+          if (skillIsDisabled(skill, disabledSkills)) editor.remove(skill.id)
+        }
+      })
+    }
+
+    if (typeof ctx.tool?.transform === "function") {
+      await ctx.tool.transform((editor) => {
+        if (!disabledSkills.size) return
+        editor.update("skill", (tool) => {
+          if (typeof tool.description !== "string") return
+          tool.description = filterV2System([tool.description], disabledSkills, knownSkills)[0]
+        })
+      })
+    }
+
+    if (typeof ctx.tool?.hook === "function") {
+      await ctx.tool.hook("execute.before", (event) => {
+        if (event.tool !== "skill" || !disabledSkills.size) return
+        const input = event.input ?? event.args
+        const name = input?.id ?? input?.name
+        const skill = v2FindSkill(knownSkills, name)
+        if (typeof name === "string" && (skillIsDisabled(skill, disabledSkills) || disabledSkills.has(name))) {
+          throw new Error(`Skill is disabled: ${name}`)
+        }
+      })
+    }
+
+    if (typeof ctx.session?.hook === "function") {
+      await ctx.session.hook("prompt", async () => {
+        if (await syncDisabledSkills()) await reloadSkillState()
+        if (options.blockFirstPrompt === false || noticeShown) return
+        await initialize()
+        if (noticeShown) return
+        throw new Error(
+          "The context preview could not be displayed, so this request was stopped before reaching the model. Run opencode-context-preview to inspect the report.",
+        )
+      })
+
+      const handleV2System = async (event) => {
+        if (!Array.isArray(event.system)) return
+        if (await syncDisabledSkills()) await reloadSkillState()
+        const filteredSystem = filterV2System(event.system, disabledSkills, knownSkills)
+        event.system.splice(0, event.system.length, ...filteredSystem)
+        if (!currentReport) return
+
+        const discovered = parseAvailableSkills(event.system.map((part) => v2SystemText(part) ?? ""))
+        if (!discovered) return
+        const skills = discovered.map((skill) => {
+          const known = v2FindSkill(knownSkills, skill.id ?? skill.name)
+          const normalized = {
+            ...skill,
+            id: known?.id ?? skill.id ?? skill.name,
+            name: known?.name ?? skill.name,
+            source: "system-prompt",
+            estimatedTokens: estimateTokens(JSON.stringify({ name: skill.name, description: skill.description })),
+          }
+          knownSkills.set(normalized.id, normalized)
+          return normalized
+        })
+        const previous = currentReport.skills
+          .map(({ id, name, description }) => `${id ?? name}\u0000${name}\u0000${description}`)
+          .sort()
+        const next = skills.map(({ id, name, description }) => `${id ?? name}\u0000${name}\u0000${description}`).sort()
+        if (previous.length === next.length && previous.every((item, index) => item === next[index])) return
+
+        currentReport.skills = skills
+        currentReport.totals.skillTokens = skills.reduce((sum, skill) => sum + skill.estimatedTokens, 0)
+        try {
+          await saveReport(currentReport)
+        } catch (error) {
+          v2Log("warn", "Could not cache the system-prompt skill inventory", error)
+        }
+      }
+
+      for (const hook of ["context", "compaction", "generate", "title"]) {
+        await ctx.session.hook(hook, handleV2System)
+      }
+    }
+
+    const controller = new AbortController()
+    let eventLoop
+    if (typeof ctx.event?.subscribe === "function") {
+      eventLoop = (async () => {
+        try {
+          const events = await ctx.event.subscribe({ signal: controller.signal })
+          for await (const event of events) {
+            if (!v2EventIsLocal(event, directory)) continue
+            if (event?.type === "server.connected" || event?.type === "session.created") {
+              if (event.type === "server.connected") await refreshReport()
+              else await initialize()
+            }
+            if (event?.type === "skill.updated" || event?.type?.startsWith?.("mcp.")) {
+              await refreshReport()
+            }
+          }
+        } catch (error) {
+          if (!controller.signal.aborted) v2Log("warn", "The context-preview event subscription stopped", error)
+        }
+      })()
+    }
+
+    void eventLoop
+    void initialize()
+    return () => controller.abort()
+  },
+})
+
+export default {
+  ...ContextPreviewV2Plugin,
+  // OpenCode V1 calls this compatibility entrypoint; its hooks are intentionally
+  // kept separate from the V2 registrations above.
+  server: async (context, options = {}) => ContextPreviewPlugin(context, options),
 }
