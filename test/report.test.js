@@ -68,7 +68,7 @@ test("formats the full report and itemized startup toast", () => {
   assert.doesNotMatch(formatReport(report), /tools|tokens.*MCP/)
   assert.match(formatToast(report), /MCP github: connected/)
   assert.match(formatToast(report), /Skill review: ~4 tokens/)
-  assert.match(formatToast(report), /Toggle these on & off with \/mcp or \/skill-toggle/)
+  assert.doesNotMatch(formatToast(report), /Toggle these on & off with \/mcp or \/skill-toggle/)
   assert.doesNotMatch(formatToast(report), /MCP values list active servers/)
 })
 

@@ -4,7 +4,7 @@ An OpenCode plugin to remind you to turn off skills and MCP servers
 
 ![Context preview in action](./docs/context-preview.png)
 
-This plugin lists connected MCP servers and estimates how many tokens agent skill descriptions will add to the model context. It shows an itemized startup preview (a TUI toast in V1 and a plugin log in V2), caches a report for a local CLI command, and can toggle skills for the current OpenCode runtime.
+This plugin lists connected MCP servers and estimates how many tokens agent skill descriptions will add to the model context. It shows an itemized startup preview (a TUI toast when the CLI plugin is enabled, with a server-log fallback), caches a report for a local CLI command, and can toggle skills for the current OpenCode runtime.
 
 ## How it Works
 
@@ -68,10 +68,10 @@ When upgrading, use the exact published version so OpenCode does not reuse a
 stale `latest` cache entry:
 
 ```sh
-opencode plugin add opencode-context-preview@0.1.2
+opencode plugin add opencode-context-preview@0.1.3
 ```
 
-Replace `0.1.2` with the version being installed.
+Replace `0.1.3` with the version being installed.
 
 The V1 plugin retries briefly while the TUI attaches. If the first prompt arrives before the startup preview appears, the plugin displays the preview and stops that request before it reaches the model. Prompt text is restored when possible; attachments must be reattached before resending. If the preview cannot be displayed, the request is also blocked by default. V2 logs the preview instead because server plugins do not have a TUI API.
 
@@ -93,7 +93,7 @@ V2 server plugins do not have a TUI API; the startup preview is written to
 the plugin log instead. The report and toggle files use the same cache format
 as V1.
 
-To show the preview as a V2 TUI toast, also enable the package's CLI plugin in
+To use `/skill-toggle` in the V2 TUI, also enable the package's CLI plugin in
 the global `~/.config/opencode/cli.json`:
 
 ```json
@@ -104,7 +104,9 @@ the global `~/.config/opencode/cli.json`:
 ```
 
 The `opencode.json` entry loads the server plugin; the `cli.json` entry loads
-the TUI plugin. For a local checkout, use
+the TUI companion. It displays the startup preview and surfaces server-side
+`/skill-toggle` toasts without registering a second `/skill-toggle` command.
+For a local checkout, use
 `{"package":"/absolute/path/to/context-preview"}` in the `plugins` array
 instead. Restart the TUI after changing either file.
 

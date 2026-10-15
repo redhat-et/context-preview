@@ -3,6 +3,8 @@ import path from "node:path"
 import os from "node:os"
 import { Plugin } from "@opencode/plugin"
 import { reportCacheFile, skillToggleFile } from "./lib/cache.js"
+import { parseSkillCommand, skillToggleKeys, stripSkillToggleCommand } from "./lib/skill-toggle.js"
+import { ContextPreviewRpc } from "./rpc.js"
 import {
   estimateTokens,
   formatToast,
@@ -58,17 +60,6 @@ function redactDisabledSkillText(text, disabled, knownSkills) {
     }
   }
   return redacted
-}
-
-function parseSkillCommand(argumentsText) {
-  const [first, second] = argumentsText.trim().split(/\s+/)
-  if (!first) return { action: "list" }
-  const actions = ["list", "on", "off", "toggle"]
-  const action = actions.includes(first) ? first : "toggle"
-  const name = actions.includes(first) ? second : first
-  if (!actions.includes(first) && second) return { error: "Use: /skill-toggle [list|on|off|toggle] [name]" }
-  if (action !== "list" && !name) return { error: `Use: /skill-toggle ${action} <name>` }
-  return { action, name }
 }
 
 function projectRoot(directory, worktree) {
@@ -640,8 +631,7 @@ function filterV2System(system, disabled, knownSkills) {
 }
 
 function v2PromptArguments(prompt) {
-  const text = typeof prompt?.text === "string" ? prompt.text.trim() : ""
-  return text.replace(/^\/?skill-toggle(?:\s+|$)/i, "").trim()
+  return stripSkillToggleCommand(prompt?.text)
 }
 
 function v2EventIsLocal(event, directory) {
@@ -663,6 +653,16 @@ export const ContextPreviewV2Plugin = Plugin.define({
     let currentReport
     let noticePromise
     let noticeShown = false
+    let toastEvents
+
+    if (typeof ctx.rpc?.register === "function") {
+      try {
+        const registration = await ctx.rpc.register(ContextPreviewRpc, {})
+        toastEvents = registration.events
+      } catch (error) {
+        v2Log("warn", "Could not register the TUI toast bridge", error)
+      }
+    }
 
     if (disabledSkills.size === 0) {
       try {
@@ -705,8 +705,13 @@ export const ContextPreviewV2Plugin = Plugin.define({
           try {
             const result = await buildV2Report({ ctx, directory, worktree: runtimeKey, disabledSkills })
             currentReport = result.report
+            const disabledKnownSkills = [...knownSkills.values()].filter((skill) => skillIsDisabled(skill, disabledSkills))
             knownSkills.clear()
             for (const skill of result.discoveredSkills) knownSkills.set(skill.id ?? skill.name, skill)
+            for (const skill of disabledKnownSkills) {
+              const key = skill.id ?? skill.name
+              if (key && !knownSkills.has(key)) knownSkills.set(key, skill)
+            }
 
             try {
               await saveReport(currentReport)
@@ -781,14 +786,28 @@ export const ContextPreviewV2Plugin = Plugin.define({
       }
     }
 
+    const showSkillToast = async (toast) => {
+      if (!toastEvents) return
+      try {
+        await toastEvents.emit("toast", toast)
+      } catch (error) {
+        v2Log("debug", "Could not send a skill-toggle toast to the TUI", error)
+      }
+    }
+
     const handleSkillCommand = async (argumentsText) => {
       const parsed = parseSkillCommand(argumentsText)
-      if (parsed.error) throw new Error(parsed.error)
+      if (parsed.error) {
+        await showSkillToast({ title: "Agent skills", message: parsed.error, variant: "error", duration: 5000 })
+        throw new Error(parsed.error)
+      }
 
       if (!currentReport) await loadReport()
       const skills = [...knownSkills.values()].sort((a, b) => a.name.localeCompare(b.name))
       if (parsed.action === "list") {
-        v2Log("info", `Agent skills\n${skillCommandMessage(skills, disabledSkills)}`)
+        const message = skillCommandMessage(skills, disabledSkills)
+        await showSkillToast({ title: "Agent skills", message, variant: "info", duration: 10000 })
+        v2Log("info", `Agent skills\n${message}`)
         return
       }
 
@@ -797,23 +816,29 @@ export const ContextPreviewV2Plugin = Plugin.define({
       if (allSkills) {
         disabledSkills.clear()
         if (parsed.action === "off") {
-          for (const skill of skills) disabledSkills.add(skill.id ?? skill.name)
+          for (const skill of skills) {
+            for (const key of skillToggleKeys(skill)) disabledSkills.add(key)
+          }
         }
         message = `All skills: ${parsed.action}`
       } else {
         const skill = skills.find((entry) => entry.id === parsed.name || entry.name === parsed.name)
-        if (!skill) throw new Error(`Unknown skill: ${parsed.name}`)
-        const key = skill.id ?? skill.name
-        if (parsed.action === "on") {
-          disabledSkills.delete(key)
-          disabledSkills.delete(skill.name)
+        if (!skill) {
+          const message = `Unknown skill: ${parsed.name}`
+          await showSkillToast({ title: "Agent skills", message, variant: "error", duration: 5000 })
+          throw new Error(message)
         }
-        if (parsed.action === "off") disabledSkills.add(key)
+        const keys = skillToggleKeys(skill)
+        if (parsed.action === "on") {
+          for (const key of keys) disabledSkills.delete(key)
+        }
+        if (parsed.action === "off") for (const key of keys) disabledSkills.add(key)
         if (parsed.action === "toggle") {
           if (skillIsDisabled(skill, disabledSkills)) {
-            disabledSkills.delete(key)
-            disabledSkills.delete(skill.name)
-          } else disabledSkills.add(key)
+            for (const key of keys) disabledSkills.delete(key)
+          } else {
+            for (const key of keys) disabledSkills.add(key)
+          }
         }
         message = `${skill.name}: ${skillIsDisabled(skill, disabledSkills) ? "off" : "on"}`
       }
@@ -825,7 +850,19 @@ export const ContextPreviewV2Plugin = Plugin.define({
       }
       await updateCachedReport()
       await reloadSkillState()
-      v2Log("info", `Agent skills: ${message}. Start a new session to clear the old context.`)
+      const toast = { title: "Agent skills", message: `${message}. Start a new session to clear the old context.`, variant: "info", duration: 5000 }
+      await showSkillToast(toast)
+      v2Log("info", `Agent skills: ${toast.message}`)
+    }
+
+    if (typeof ctx.command?.transform === "function") {
+      await ctx.command.transform((editor) => {
+        editor.add({
+          name: "skill-toggle",
+          description: "List or toggle skills",
+          execute: async (input) => handleSkillCommand(v2PromptArguments(input?.prompt)),
+        })
+      })
     }
 
     // Load the initial inventory before registering the V2 skill transform so disabled
