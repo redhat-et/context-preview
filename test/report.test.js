@@ -106,6 +106,7 @@ test("builds the startup toast and saves a CLI-readable report", async (t) => {
   const cacheDirectory = path.join(temp, "cache")
   const project = path.join(temp, "project")
   await mkdir(path.join(project, ".opencode", "skills", "review"), { recursive: true })
+  await mkdir(path.join(project, ".opencode", "skills", "go"), { recursive: true })
   await mkdir(path.join(project, ".opencode", "skills", "private-skill"), { recursive: true })
   await mkdir(path.join(project, ".opencode", "skill", "legacy"), { recursive: true })
   await mkdir(path.join(project, ".claude", "skills", "claude-skill"), { recursive: true })
@@ -117,6 +118,10 @@ test("builds the startup toast and saves a CLI-readable report", async (t) => {
   await writeFile(
     path.join(project, ".opencode", "skills", "review", "SKILL.md"),
     "---\nname: review\ndescription: Review changes carefully\n---\nInstructions",
+  )
+  await writeFile(
+    path.join(project, ".opencode", "skills", "go", "SKILL.md"),
+    "---\nname: go\ndescription: Use ongoing guidance\n---\nInstructions",
   )
   await writeFile(
     path.join(project, ".opencode", "skills", "private-skill", "SKILL.md"),
@@ -290,10 +295,40 @@ test("builds the startup toast and saves a CLI-readable report", async (t) => {
   assert.equal(toastBodies.length, 3)
 
   await assert.rejects(
+    hooks["command.execute.before"]({ command: "skill-toggle", arguments: "off go" }, { parts: [] }),
+    /Skill command handled/,
+  )
+  const shortSkillSystem = {
+    system: [
+      "Keep ongoing goals and guidance.",
+      "<available_skills><skill><name>go</name><description>Use ongoing guidance</description></skill><skill><name>legacy</name><description>Legacy singular skill path</description></skill></available_skills>",
+    ],
+  }
+  await hooks["experimental.chat.system.transform"]({}, shortSkillSystem)
+  assert.doesNotMatch(shortSkillSystem.system.join("\n"), /<name>go<\/name>/)
+  assert.match(shortSkillSystem.system.join("\n"), /ongoing goals and guidance/)
+  assert.match(shortSkillSystem.system.join("\n"), /<name>legacy<\/name>/)
+  await assert.rejects(
+    hooks["command.execute.before"]({ command: "skill-toggle", arguments: "on go" }, { parts: [] }),
+    /Skill command handled/,
+  )
+  await assert.rejects(
+    hooks["command.execute.before"]({ command: "skill-toggle", arguments: "toggle go" }, { parts: [] }),
+    /Skill command handled/,
+  )
+  assert.deepEqual(JSON.parse(await readFile(skillToggleFile(project), "utf8")), { disabledSkills: ["go"] })
+  await assert.rejects(
+    hooks["command.execute.before"]({ command: "skill-toggle", arguments: "toggle go" }, { parts: [] }),
+    /Skill command handled/,
+  )
+  assert.deepEqual(JSON.parse(await readFile(skillToggleFile(project), "utf8")), { disabledSkills: [] })
+
+  await assert.rejects(
     hooks["command.execute.before"]({ command: "skill-toggle", arguments: "off review" }, { parts: [] }),
     /Skill command handled/,
   )
   assert.deepEqual(JSON.parse(await readFile(skillToggleFile(project), "utf8")), { disabledSkills: ["review"] })
+  assert.doesNotMatch(await readFile(reportCacheFile(canonicalProject), "utf8"), /"name": "review"/)
   await assert.rejects(
     hooks["command.execute.before"]({ command: "skill-toggle", arguments: "off all" }, { parts: [] }),
     /Skill command handled/,

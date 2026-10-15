@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises"
 import path from "node:path"
 import { Plugin } from "@opencode/plugin/tui"
 import { skillToggleFile } from "./lib/cache.js"
+import { skillToggleMatches } from "./lib/skill-toggle.js"
 import { estimateTokens, formatToast } from "./lib/report.js"
 import { ContextPreviewRpc } from "./rpc.js"
 
@@ -33,6 +34,10 @@ function projectRoot(context, location) {
   return matching[0]?.canonical ?? directory
 }
 
+function skillIsDisabled(skill, disabled) {
+  return [...disabled].some((key) => skillToggleMatches(skill, key))
+}
+
 async function buildReport(context, location, disabled) {
   await Promise.all([
     context.data.location.mcp.server.sync(location),
@@ -49,7 +54,7 @@ async function buildReport(context, location, disabled) {
       source: "v2",
       estimatedTokens: estimateTokens(JSON.stringify({ name: skill.name ?? skill.id, description: skill.description })),
     }))
-    .filter((skill) => !disabled.has(skill.id) && !disabled.has(skill.name))
+    .filter((skill) => !skillIsDisabled(skill, disabled))
 
   return {
     generatedAt: new Date().toISOString(),

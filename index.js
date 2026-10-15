@@ -1,9 +1,14 @@
-import { mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises"
+import { mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises"
 import path from "node:path"
 import os from "node:os"
 import { Plugin } from "@opencode/plugin"
 import { reportCacheFile, skillToggleFile } from "./lib/cache.js"
-import { parseSkillCommand, skillToggleKeys, stripSkillToggleCommand } from "./lib/skill-toggle.js"
+import {
+  parseSkillCommand,
+  skillToggleKey,
+  skillToggleMatches,
+  stripSkillToggleCommand,
+} from "./lib/skill-toggle.js"
 import { ContextPreviewRpc } from "./rpc.js"
 import {
   estimateTokens,
@@ -22,6 +27,7 @@ const SKILL_LOCATIONS = [
 // Plugin instances can be recreated while the OpenCode process remains alive.
 // Keep toggles at runtime scope so a session transition does not re-enable skills.
 const disabledSkillsByProject = new Map()
+const fileWriteQueues = new Map()
 
 function valueOf(result) {
   return result?.data ?? result
@@ -35,28 +41,84 @@ function skillCommandMessage(skills, disabled) {
 }
 
 function skillIsDisabled(skill, disabled) {
-  return disabled.has(skill?.id) || disabled.has(skill?.name)
+  return [...disabled].some((key) => skillToggleMatches(skill, key))
 }
 
-function filterDisabledSkills(system, disabled) {
+function clearSkillToggleKeys(disabled, skill) {
+  for (const key of disabled) {
+    if (skillToggleMatches(skill, key)) disabled.delete(key)
+  }
+}
+
+function filterDisabledSkills(system, disabled, knownSkills) {
   if (disabled.size === 0) return system
   const filtered = system.map((text) => {
     if (!text.includes("<available_skills>")) return text
     return text.replace(/\s*<skill>[\s\S]*?<\/skill>/g, (entry) => {
+      const id = entry.match(/<id>\s*([^<]+?)\s*<\/id>/)?.[1]
       const name = entry.match(/<name>\s*([^<]+?)\s*<\/name>/)?.[1]
-      return name && disabled.has(name) ? "" : entry
+      const skill = knownSkillForKey(knownSkills, id ?? name) ?? { id, name }
+      return skillIsDisabled(skill, disabled) ? "" : entry
     })
   })
   return filtered
 }
 
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function knownSkillsForKey(knownSkills, key) {
+  const direct = knownSkills?.get?.(key)
+  const matches = [...(knownSkills?.values?.() ?? [])].filter((skill) => skillToggleMatches(skill, key))
+  if (direct && !matches.includes(direct)) matches.unshift(direct)
+  return matches
+}
+
+function knownSkillForKey(knownSkills, key) {
+  return knownSkillsForKey(knownSkills, key)[0]
+}
+
+function skillCommandTarget(skills, key) {
+  const exact = skills.filter((skill) => skill.name === key || skill.id === key)
+  const explicit = exact.find((skill) => skill.id && skill.id !== skill.name)
+  if (explicit) return explicit
+  return skills
+    .filter((skill) => skill.name === key || skill.id === key || skillToggleMatches(skill, key))
+    .sort((left, right) => Number(left.source === "system-prompt") - Number(right.source === "system-prompt"))[0] ?? exact[0]
+}
+
+function redactSkillValue(text, value) {
+  const escaped = escapeRegExp(value.normalize("NFC"))
+  const pattern = new RegExp(
+    `(?<![\\p{L}\\p{N}\\p{M}_-])${escaped}(?![\\p{L}\\p{N}\\p{M}_-])`,
+    "gu",
+  )
+  const normalized = text.normalize("NFC")
+  const parts = []
+  let cursor = 0
+  for (const match of normalized.matchAll(/<[^>]*>/g)) {
+    parts.push(normalized.slice(cursor, match.index).replace(pattern, ""), match[0])
+    cursor = match.index + match[0].length
+  }
+  parts.push(normalized.slice(cursor).replace(pattern, ""))
+  return parts.join("")
+}
+
 function redactDisabledSkillText(text, disabled, knownSkills) {
   let redacted = text
-  for (const name of disabled) {
-    const skill = knownSkills.get(name)
-    for (const value of [name, skill?.id, skill?.name, skill?.description]) {
+  for (const key of disabled) {
+    const skills = knownSkillsForKey(knownSkills, key)
+    if (skills.length === 0) continue
+    const values = new Set([key])
+    for (const skill of skills) {
+      for (const value of [skill?.id, skill?.name, skill?.description]) {
+        if (typeof value === "string" && value) values.add(value)
+      }
+    }
+    for (const value of values) {
       if (!value) continue
-      redacted = redacted.replaceAll(value, "")
+      redacted = redactSkillValue(redacted, value)
     }
   }
   return redacted
@@ -233,10 +295,28 @@ async function buildReport({ client, directory, worktree }) {
   }
 }
 
+async function writeJsonFile(file, value) {
+  const previous = fileWriteQueues.get(file) ?? Promise.resolve()
+  const write = previous.catch(() => {}).then(async () => {
+    await mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
+    const temporary = `${file}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`
+    try {
+      await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 })
+      await rename(temporary, file)
+    } finally {
+      await unlink(temporary).catch(() => {})
+    }
+  })
+  fileWriteQueues.set(file, write)
+  try {
+    await write
+  } finally {
+    if (fileWriteQueues.get(file) === write) fileWriteQueues.delete(file)
+  }
+}
+
 async function saveReport(report) {
-  const file = reportCacheFile(report.worktree)
-  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
-  await writeFile(file, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 })
+  await writeJsonFile(reportCacheFile(report.worktree), report)
 }
 
 async function showStartupToast(client, report) {
@@ -299,8 +379,23 @@ export const ContextPreviewPlugin = async ({ client, directory, worktree }, opti
 
   const saveDisabledSkills = async () => {
     const file = skillToggleFile(runtimeKey)
-    await mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
-    await writeFile(file, `${JSON.stringify({ disabledSkills: [...disabledSkills].sort() }, null, 2)}\n`, { mode: 0o600 })
+    await writeJsonFile(file, { disabledSkills: [...disabledSkills].sort() })
+  }
+
+  const syncDisabledSkills = async () => {
+    try {
+      const saved = JSON.parse(await readFile(skillToggleFile(runtimeKey), "utf8"))
+      if (!Array.isArray(saved.disabledSkills)) return false
+      const next = new Set(saved.disabledSkills.filter((name) => typeof name === "string" && name))
+      const previous = JSON.stringify([...disabledSkills].sort())
+      const current = JSON.stringify([...next].sort())
+      if (previous === current) return false
+      disabledSkills.clear()
+      for (const name of next) disabledSkills.add(name)
+      return true
+    } catch {
+      return false
+    }
   }
 
   const startNewSession = async () => {
@@ -318,7 +413,7 @@ export const ContextPreviewPlugin = async ({ client, directory, worktree }, opti
         let report
         try {
           const discoveredReport = await buildReport({ client, directory, worktree })
-          const enabledSkills = discoveredReport.skills.filter((skill) => !disabledSkills.has(skill.name))
+          const enabledSkills = discoveredReport.skills.filter((skill) => !skillIsDisabled(skill, disabledSkills))
           report = {
             ...discoveredReport,
             skills: enabledSkills,
@@ -344,6 +439,24 @@ export const ContextPreviewPlugin = async ({ client, directory, worktree }, opti
       })()
     }
     return reportPromise
+  }
+
+  const updateCachedReport = async () => {
+    if (!currentReport || knownSkills.size === 0) return
+    const skills = [...knownSkills.values()].filter((skill) => !skillIsDisabled(skill, disabledSkills))
+    currentReport = {
+      ...currentReport,
+      skills,
+      totals: {
+        ...currentReport.totals,
+        skillTokens: skills.reduce((sum, skill) => sum + skill.estimatedTokens, 0),
+      },
+    }
+    try {
+      await saveReport(currentReport)
+    } catch (error) {
+      await logWarning("Could not cache the updated skill toggle state", error)
+    }
   }
 
   const initialize = async () => {
@@ -384,6 +497,7 @@ export const ContextPreviewPlugin = async ({ client, directory, worktree }, opti
     },
     "command.execute.before": async (input) => {
       if (input.command !== "skill-toggle") return
+      if (await syncDisabledSkills()) await updateCachedReport()
       const parsed = parseSkillCommand(input.arguments ?? "")
       if (parsed.error) throw new Error(parsed.error)
 
@@ -404,25 +518,34 @@ export const ContextPreviewPlugin = async ({ client, directory, worktree }, opti
         if (allSkills) {
           disabledSkills.clear()
           if (parsed.action === "off") {
-            for (const skill of skills) disabledSkills.add(skill.name)
+            for (const skill of skills) disabledSkills.add(skillToggleKey(skill))
           }
           message = `All skills: ${parsed.action}`
         } else {
-          const skill = skills.find((entry) => entry.name === parsed.name)
+          const skill = skillCommandTarget(skills, parsed.name)
           if (!skill) throw new Error(`Unknown skill: ${parsed.name}`)
-          if (parsed.action === "on") disabledSkills.delete(skill.name)
-          if (parsed.action === "off") disabledSkills.add(skill.name)
-          if (parsed.action === "toggle") {
-            if (disabledSkills.has(skill.name)) disabledSkills.delete(skill.name)
-            else disabledSkills.add(skill.name)
+          if (parsed.action === "on") {
+            clearSkillToggleKeys(disabledSkills, skill)
           }
-          message = `${skill.name}: ${disabledSkills.has(skill.name) ? "off" : "on"}`
+          if (parsed.action === "off") {
+            clearSkillToggleKeys(disabledSkills, skill)
+            disabledSkills.add(skillToggleKey(skill))
+          }
+          if (parsed.action === "toggle") {
+            if (skillIsDisabled(skill, disabledSkills)) {
+              clearSkillToggleKeys(disabledSkills, skill)
+            } else {
+              disabledSkills.add(skillToggleKey(skill))
+            }
+          }
+          message = `${skill.name}: ${skillIsDisabled(skill, disabledSkills) ? "off" : "on"}`
         }
         try {
           await saveDisabledSkills()
         } catch (error) {
           await logWarning("Could not save skill toggle state", error)
         }
+        await updateCachedReport()
         await startNewSession()
         await client.tui.showToast({
           body: {
@@ -438,16 +561,23 @@ export const ContextPreviewPlugin = async ({ client, directory, worktree }, opti
       throw new Error("Skill command handled by the context-preview plugin.")
     },
     "tool.execute.before": async (input, output) => {
-      if (input.tool !== "skill" || !disabledSkills.size) return
+      if (input.tool !== "skill") return
+      if (await syncDisabledSkills()) await updateCachedReport()
+      if (!disabledSkills.size) return
+      await loadReport()
       const name = output.args?.name
-      if (typeof name === "string" && disabledSkills.has(name)) {
+      const skill = knownSkillForKey(knownSkills, name)
+      if (typeof name === "string" && skillIsDisabled(skill ?? { name }, disabledSkills)) {
         throw new Error(`Skill is disabled: ${name}`)
       }
     },
     "tool.definition": async (input, output) => {
-      if (input.toolID !== "skill" || !disabledSkills.size) return
+      if (input.toolID !== "skill") return
+      if (await syncDisabledSkills()) await updateCachedReport()
+      if (!disabledSkills.size) return
+      await loadReport()
       output.description = redactDisabledSkillText(
-        filterDisabledSkills([output.description], disabledSkills)[0],
+        filterDisabledSkills([output.description], disabledSkills, knownSkills)[0],
         disabledSkills,
         knownSkills,
       )
@@ -474,7 +604,9 @@ export const ContextPreviewPlugin = async ({ client, directory, worktree }, opti
       )
     },
     "experimental.chat.system.transform": async (_input, output) => {
-      const filteredSystem = filterDisabledSkills(output.system, disabledSkills)
+      if (await syncDisabledSkills()) await updateCachedReport()
+      if (disabledSkills.size) await loadReport()
+      const filteredSystem = filterDisabledSkills(output.system, disabledSkills, knownSkills)
         .map((text) => redactDisabledSkillText(text, disabledSkills, knownSkills))
       output.system.splice(0, output.system.length, ...filteredSystem)
       if (!currentReport) return
@@ -650,7 +782,10 @@ export const ContextPreviewV2Plugin = Plugin.define({
     disabledSkillsByProject.set(runtimeKey, disabledSkills)
     const knownSkills = new Map()
     let reportPromise
+    let reportGeneration = 0
+    let disabledStateVersion = 0
     let currentReport
+    let availableSkills = new Map()
     let noticePromise
     let noticeShown = false
     let toastEvents
@@ -679,8 +814,7 @@ export const ContextPreviewV2Plugin = Plugin.define({
 
     const saveDisabledSkills = async () => {
       const file = skillToggleFile(runtimeKey)
-      await mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
-      await writeFile(file, `${JSON.stringify({ disabledSkills: [...disabledSkills].sort() }, null, 2)}\n`, { mode: 0o600 })
+      await writeJsonFile(file, { disabledSkills: [...disabledSkills].sort() })
     }
 
     const syncDisabledSkills = async () => {
@@ -693,6 +827,7 @@ export const ContextPreviewV2Plugin = Plugin.define({
         if (previous === current) return false
         disabledSkills.clear()
         for (const name of next) disabledSkills.add(name)
+        disabledStateVersion += 1
         return true
       } catch {
         return false
@@ -701,11 +836,24 @@ export const ContextPreviewV2Plugin = Plugin.define({
 
     const loadReport = () => {
       if (!reportPromise) {
-        reportPromise = (async () => {
+        const generation = reportGeneration
+        const stateVersion = disabledStateVersion
+        const task = (async () => {
           try {
-            const result = await buildV2Report({ ctx, directory, worktree: runtimeKey, disabledSkills })
+            const disabledAtStart = new Set(disabledSkills)
+            const result = await buildV2Report({ ctx, directory, worktree: runtimeKey, disabledSkills: disabledAtStart })
+            const disabledKnownSkills = [...knownSkills.values()].filter(
+              (skill) => skillIsDisabled(skill, disabledSkills) || skillIsDisabled(skill, disabledAtStart),
+            )
+
+            if (generation !== reportGeneration || stateVersion !== disabledStateVersion) {
+              if (generation !== reportGeneration) return currentReport
+              reportPromise = undefined
+              return loadReport()
+            }
+
             currentReport = result.report
-            const disabledKnownSkills = [...knownSkills.values()].filter((skill) => skillIsDisabled(skill, disabledSkills))
+            availableSkills = new Map(result.discoveredSkills.map((skill) => [skill.id ?? skill.name, skill]))
             knownSkills.clear()
             for (const skill of result.discoveredSkills) knownSkills.set(skill.id ?? skill.name, skill)
             for (const skill of disabledKnownSkills) {
@@ -718,13 +866,20 @@ export const ContextPreviewV2Plugin = Plugin.define({
             } catch (error) {
               v2Log("warn", "Could not cache the context preview for the CLI", error)
             }
+
+            if (generation !== reportGeneration || stateVersion !== disabledStateVersion) {
+              if (generation !== reportGeneration) return currentReport
+              reportPromise = undefined
+              return loadReport()
+            }
             return currentReport
           } catch (error) {
-            reportPromise = undefined
+            if (generation === reportGeneration) reportPromise = undefined
             v2Log("warn", "Could not build the context preview", error)
             return undefined
           }
         })()
+        reportPromise = task
       }
       return reportPromise
     }
@@ -750,6 +905,11 @@ export const ContextPreviewV2Plugin = Plugin.define({
     }
 
     const refreshReport = async () => {
+      if (await syncDisabledSkills()) {
+        await updateCachedReport()
+        await reloadSkillState()
+      }
+      reportGeneration += 1
       reportPromise = undefined
       await loadReport()
       if (!noticeShown) await initialize()
@@ -757,7 +917,7 @@ export const ContextPreviewV2Plugin = Plugin.define({
 
     const updateCachedReport = async () => {
       if (!currentReport) return
-      const skills = [...knownSkills.values()].filter((skill) => !skillIsDisabled(skill, disabledSkills))
+      const skills = [...availableSkills.values()].filter((skill) => !skillIsDisabled(skill, disabledSkills))
       currentReport = {
         ...currentReport,
         skills,
@@ -802,6 +962,10 @@ export const ContextPreviewV2Plugin = Plugin.define({
         throw new Error(parsed.error)
       }
 
+      if (await syncDisabledSkills()) {
+        await updateCachedReport()
+        await reloadSkillState()
+      }
       if (!currentReport) await loadReport()
       const skills = [...knownSkills.values()].sort((a, b) => a.name.localeCompare(b.name))
       if (parsed.action === "list") {
@@ -816,9 +980,7 @@ export const ContextPreviewV2Plugin = Plugin.define({
       if (allSkills) {
         disabledSkills.clear()
         if (parsed.action === "off") {
-          for (const skill of skills) {
-            for (const key of skillToggleKeys(skill)) disabledSkills.add(key)
-          }
+          for (const skill of skills) disabledSkills.add(skillToggleKey(skill))
         }
         message = `All skills: ${parsed.action}`
       } else {
@@ -828,20 +990,24 @@ export const ContextPreviewV2Plugin = Plugin.define({
           await showSkillToast({ title: "Agent skills", message, variant: "error", duration: 5000 })
           throw new Error(message)
         }
-        const keys = skillToggleKeys(skill)
         if (parsed.action === "on") {
-          for (const key of keys) disabledSkills.delete(key)
+          clearSkillToggleKeys(disabledSkills, skill)
         }
-        if (parsed.action === "off") for (const key of keys) disabledSkills.add(key)
+        if (parsed.action === "off") {
+          clearSkillToggleKeys(disabledSkills, skill)
+          disabledSkills.add(skillToggleKey(skill))
+        }
         if (parsed.action === "toggle") {
           if (skillIsDisabled(skill, disabledSkills)) {
-            for (const key of keys) disabledSkills.delete(key)
+            clearSkillToggleKeys(disabledSkills, skill)
           } else {
-            for (const key of keys) disabledSkills.add(key)
+            disabledSkills.add(skillToggleKey(skill))
           }
         }
         message = `${skill.name}: ${skillIsDisabled(skill, disabledSkills) ? "off" : "on"}`
       }
+
+      disabledStateVersion += 1
 
       try {
         await saveDisabledSkills()
@@ -850,6 +1016,7 @@ export const ContextPreviewV2Plugin = Plugin.define({
       }
       await updateCachedReport()
       await reloadSkillState()
+      await refreshReport()
       const toast = { title: "Agent skills", message: `${message}. Start a new session to clear the old context.`, variant: "info", duration: 5000 }
       await showSkillToast(toast)
       v2Log("info", `Agent skills: ${toast.message}`)
@@ -888,8 +1055,13 @@ export const ContextPreviewV2Plugin = Plugin.define({
     }
 
     if (typeof ctx.tool?.hook === "function") {
-      await ctx.tool.hook("execute.before", (event) => {
-        if (event.tool !== "skill" || !disabledSkills.size) return
+      await ctx.tool.hook("execute.before", async (event) => {
+        if (event.tool !== "skill") return
+        if (await syncDisabledSkills()) {
+          await updateCachedReport()
+          await reloadSkillState()
+        }
+        if (!disabledSkills.size) return
         const input = event.input ?? event.args
         const name = input?.id ?? input?.name
         const skill = v2FindSkill(knownSkills, name)
@@ -901,7 +1073,10 @@ export const ContextPreviewV2Plugin = Plugin.define({
 
     if (typeof ctx.session?.hook === "function") {
       await ctx.session.hook("prompt", async () => {
-        if (await syncDisabledSkills()) await reloadSkillState()
+        if (await syncDisabledSkills()) {
+          await updateCachedReport()
+          await reloadSkillState()
+        }
         if (options.blockFirstPrompt === false || noticeShown) return
         await initialize()
         if (noticeShown) return
@@ -912,7 +1087,10 @@ export const ContextPreviewV2Plugin = Plugin.define({
 
       const handleV2System = async (event) => {
         if (!Array.isArray(event.system)) return
-        if (await syncDisabledSkills()) await reloadSkillState()
+        if (await syncDisabledSkills()) {
+          await updateCachedReport()
+          await reloadSkillState()
+        }
         const filteredSystem = filterV2System(event.system, disabledSkills, knownSkills)
         event.system.splice(0, event.system.length, ...filteredSystem)
         if (!currentReport) return
@@ -931,6 +1109,7 @@ export const ContextPreviewV2Plugin = Plugin.define({
           knownSkills.set(normalized.id, normalized)
           return normalized
         })
+        availableSkills = new Map(skills.map((skill) => [skill.id ?? skill.name, skill]))
         const previous = currentReport.skills
           .map(({ id, name, description }) => `${id ?? name}\u0000${name}\u0000${description}`)
           .sort()
